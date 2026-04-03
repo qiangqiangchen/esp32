@@ -16,9 +16,77 @@
 #define BTN_PIN 25                // BTN 引脚
 
 // NLSF 引脚定义
-#define NLSF_DATA_PIN 23          // SI
-#define NLSF_CLOCK_PIN 5          // RCK
-#define NLSF_LATCH_PIN 18         // SCK
+#define NLSF_DATA_PIN 23          // SI  （串行数据输入）
+#define NLSF_LATCH_PIN 5          // RCK （锁存时钟）
+#define NLSF_CLOCK_PIN 18         // SCK （移位时钟）
+
+
+
+// 595 输出位定义
+// LED1 (RGB LED #1)
+#define LED1_RED_BIT 2            // Q0
+#define LED1_GREEN_BIT 1          // Q1
+#define LED1_BLUE_BIT 0           // Q2
+// LED2 (RGB LED #2)
+#define LED2_RED_BIT 5            // Q3
+#define LED2_GREEN_BIT 4          // Q4
+#define LED2_BLUE_BIT 3           // Q5
+
+// RED LED 定义
+#define LED4_PIN 19               // RED4 LED 引脚定义
+
+
+
+// RGB LED 类型配置
+// 共阴极(Common Cathode): HIGH=亮, LOW=灭 → INVERT=false
+// 共阳极(Common Anode):   LOW=亮, HIGH=灭 → INVERT=true
+#define RGB_INVERT true
+
+// 595 当前输出状态（8位）
+byte shiftRegState = 0x00;
+
+// RGB LED 动画相关
+enum RgbMode {
+  RGB_IDLE,                       // 无动画
+  RGB_RED_STEADY,                 // 红色常亮
+  RGB_BLUE_STEADY,                // 蓝色常亮
+  RGB_GREEN_STEADY,               // 绿色常亮
+  RGB_COLOR_CHANGE,               // 每秒变色
+  RGB_RAINBOW,                    // 彩虹循环
+  RGB_BREATHING,                  // 呼吸灯效果
+  RGB_COLOR_WHEEL,                // 色轮
+};
+
+// LED 模式
+RgbMode currentRgbMode = RGB_IDLE;
+
+// 模式定义
+enum LightMode
+{
+  MODE_OFF,    // 关灯
+  MODE_ON,     // 常亮
+  MODE_BLINK,  // 闪烁
+  MODE_BREATHE // 呼吸灯
+};
+LightMode currentLedMode = MODE_OFF;
+
+unsigned long rgbLastUpdate = 0;
+int rgbColorIndex = 0;
+int rgbBreathStep = 0;
+bool rgbBreathDir = true; // true：渐亮 false: 渐暗
+unsigned long rgbBreathLastUpdate = 0;
+
+const byte COLOR_TABLE[][3] = {
+  {1, 0, 0}, // 红
+  {0, 1, 0}, // 绿
+  {0, 0, 1}, // 蓝
+  {1, 1, 0}, // 黄
+  {0, 1, 1}, // 青
+  {1, 0, 1}, // 紫
+  {1, 1, 1}, // 白
+};
+
+const int COLOR_COUNT = sizeof(COLOR_TABLE) / sizeof(COLOR_TABLE[0]);
 
 // 摇杆定义
 #define VERT_PIN 12                // 纵轴输出
@@ -27,8 +95,8 @@
 
 #define JOY_CENTER 2048             // 摇杆中间值 
 #define JOY_THRESHOLD 1800          // 偏移超过此值才认为有方向输入
-#define JOY_REPEAT_FIRST 300      // 首次触发后的等待时间（ms）
-#define JOY_REPEAT_NEXT 150        // 连续触发间隔（ms）
+#define JOY_REPEAT_FIRST 300        // 首次触发后的等待时间（ms）
+#define JOY_REPEAT_NEXT 150         // 连续触发间隔（ms）
 
 // 创建屏幕对象，之后所有对屏幕的操作都通过display.xx() 来调用
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
@@ -44,6 +112,9 @@ bool currentButtonState = HIGH;          // 当前确认的按键状态
 unsigned long lastDebounceTime = 0;      // 上一次按键状态变化的时间
 const unsigned long DEBOUNCE_DELAY = 50; // 消抖延时：50毫秒
 
+
+// 记录是否正在滚动
+bool isScroll = false;
 
 // 摇杆方向枚举
 enum JoyDirection {
@@ -90,18 +161,22 @@ MenuItem rgbLedSubMenu[] = {
   {"Red steady on", NULL, 0, onRgbLedDemo},
   {"Blue steady on", NULL, 0, onRgbLedDemo},
   {"Green steady on", NULL, 0, onRgbLedDemo},
-  {"Change color every 1 second", NULL, 0, onRgbLedDemo},
+  {"Change color every 1s", NULL, 0, onRgbLedDemo},
+  {"Rainbow cycle", NULL, 0, onRgbLedDemo},
+  {"Breathing effect", NULL, 0, onRgbLedDemo},
+  {"Color wheel", NULL, 0, onRgbLedDemo},
+  {"All OFF", NULL, 0, onRgbLedDemo},
 };
 
 const int rgbLedSubMenuCount = sizeof(rgbLedSubMenu) / sizeof(rgbLedSubMenu[0]);
 
 // 主菜单定义
 MenuItem mainMenu[] = {
-  {"Text Demo", NULL, 0, onTextDemo},
-  {"Shapes Demo", NULL, 0, onShapesDemo},
+  {"Text Demo-Different font size examples", NULL, 0, onTextDemo},
+  {"Shapes Demo-Draw triangles/rectangles/circles", NULL, 0, onShapesDemo},
   {"ProgressBar Demo", NULL, 0, onProgressBarDemo},
   {"Scroll Demo", NULL, 0, onScrollDemo },
-  {"LED Demo", ledSubMenu, ledSubMenuCount, NULL},
+  {"LED Demo-Constant / Blinking / Breathing light", ledSubMenu, ledSubMenuCount, NULL},
   {"RGBLED Demo", rgbLedSubMenu, rgbLedSubMenuCount, NULL},
   {"BUTTON Demo", NULL, 0, onButtonDemo},
 };
@@ -160,6 +235,24 @@ bool inActionMode = false;
 const char* actionLabel = NULL;
 
 
+
+// PWM 参数，用于控制LED4
+const int PWM_FREQ = 5000;
+const int PWM_RESOLUTION = 8;
+
+// 闪烁模式相关变量
+unsigned long lastBlinkTime = 0;             // 上一次 LED 切换亮灭的时间
+const unsigned long BLINK_INTERVAL = 300;    // 闪烁间隔：300毫秒
+bool blinkState = false;                     // 当前闪烁状态
+
+
+// 呼吸灯模式相关变量
+int breathBrighness = 0;                   // 当前亮度值（0~255）
+int breathDirection = 5;                   // 亮度变化步长和方向
+unsigned long lastBreatheTime = 0;         // 上一次更新亮度的时间
+const unsigned long BREATHE_INTERVAL = 15; // 亮度更新间隔：15毫秒
+
+
 // 函数前向声明
 JoyDirection readJoystick();
 void handleJoystickInput(JoyDirection dir);
@@ -174,10 +267,300 @@ void drawScrollBar(int offset, int totalItems, int visibleItems);
 void showActionScreen(const char* label);
 
 
+// 595+RGB 函数前向声明
+void shiftOut595(byte data);
+void setShiftBit(int bit, bool value);
+void clearShiftReg();
+void setLed1Color(bool r, bool g, bool b);
+void setLed2Color(bool r, bool g, bool b);
+void setBothLedsColor(bool r, bool g, bool b);
+void setLed1FromTable(int colorIndex);
+void setLed2FromTable(int colorIndex);
+void setBothLedsFromTable(int colorIndex);
+void allLedsOff();
+void ledOff();
+void updateRgbAnimation();
+
+// ============================================================
+// 595 移位寄存器操作
+// ============================================================
+
+// 向595发送一个字节并锁存输出
+void shiftOut595(byte data) {
+  digitalWrite(NLSF_LATCH_PIN, LOW);
+  shiftOut(NLSF_DATA_PIN, NLSF_CLOCK_PIN, MSBFIRST, data);
+  digitalWrite(NLSF_LATCH_PIN, HIGH);
+}
+
+// 设置595某一位的值，并立即更新输出
+void setShiftBit(int bit, bool value) {
+  if (value) {
+    shiftRegState |= (1 << bit);
+  } else {
+    shiftRegState &= ~(1 << bit);
+  }
+  shiftOut595(shiftRegState);
+}
+
+// 清空595所有输出
+void clearShiftReg() {
+  if (RGB_INVERT) {
+    shiftRegState = 0xFF;      // 共阳极： 全部HIGH = 全灭
+  } else {
+    shiftRegState = 0x00;
+  }
+
+  shiftOut595(shiftRegState);
+}
 
 
-void setup()
-{
+// ============================================================
+// RGB LED 颜色控制
+// ============================================================
+
+// 设置 LED1 的 RGB 的颜色 r/g/b: true = 亮，false = 灭
+void setLed1Color(bool r, bool g, bool b) {
+  if (RGB_INVERT) {
+    r = !r;
+    g = !g;
+    b = !b;
+  }
+
+  if (r) shiftRegState |= (1 << LED1_RED_BIT);
+  else shiftRegState &= ~(1 << LED1_RED_BIT);
+
+  if (g) shiftRegState |= (1 << LED1_GREEN_BIT);
+  else shiftRegState &= ~(1 << LED1_GREEN_BIT);
+
+  if (b) shiftRegState |= (1 << LED1_BLUE_BIT);
+  else shiftRegState &= ~(1 << LED1_BLUE_BIT);
+
+  shiftOut595(shiftRegState);
+}
+
+// 设置 LED2 的 RGB 的颜色 r/g/b: true = 亮，false = 灭
+void setLed2Color(bool r, bool g, bool b) {
+  if (RGB_INVERT) {
+    r = !r;
+    g = !g;
+    b = !b;
+  }
+
+  if (r) shiftRegState |= (1 << LED2_RED_BIT);
+  else shiftRegState &= ~(1 << LED2_RED_BIT);
+
+  if (g) shiftRegState |= (1 << LED2_GREEN_BIT);
+  else shiftRegState &= ~(1 << LED2_GREEN_BIT);
+
+  if (b) shiftRegState |= (1 << LED2_BLUE_BIT);
+  else shiftRegState &= ~(1 << LED2_BLUE_BIT);
+
+  shiftOut595(shiftRegState);
+}
+
+
+// 同时设置两个LED相同的颜色
+void setBothLedsColor(bool r, bool g, bool b) {
+  setLed1Color(r, g, b);
+  setLed2Color(r, g, b);
+}
+
+
+// 用颜色表索引设置LED1
+void setLed1FromTable(int colorIndex) {
+  int idx = colorIndex % COLOR_COUNT;
+  setLed1Color(COLOR_TABLE[idx][0], COLOR_TABLE[idx][1], COLOR_TABLE[idx][2]);
+}
+
+
+// 用颜色表索引设置LED2
+void setLed2FromTable(int colorIndex) {
+  int idx = colorIndex % COLOR_COUNT;
+  setLed2Color(COLOR_TABLE[idx][0], COLOR_TABLE[idx][1], COLOR_TABLE[idx][2]);
+}
+
+
+// 用颜色表索引同时设置两个LED
+void setBothLedsFromTable(int colorIndex) {
+  setLed1FromTable(colorIndex);
+  setLed2FromTable(colorIndex);
+}
+
+
+// 关闭所有LED
+void allLedsOff() {
+  if (RGB_INVERT) {
+    shiftRegState = 0xFF;   // 共阳极全灭
+  } else {
+    shiftRegState = 0x00;   // 共阴极全灭
+  }
+  shiftOut595(shiftRegState);
+}
+
+
+// LED 相关更新
+void updateLedAction() {
+  unsigned long now = millis();
+  switch (currentLedMode) {
+    case MODE_OFF:            // 关灯
+    case MODE_ON:             // 常亮
+      break;
+    case MODE_BLINK:          // 闪烁
+      if (now - lastBlinkTime >= BLINK_INTERVAL) {
+        // 重置最后记录的时间
+        lastBlinkTime = now;
+
+        // 闪烁状态取反
+        blinkState = !blinkState;
+        // 根据闪烁状态设置LED亮灭
+        if (blinkState)
+        {
+          ledcWrite(LED4_PIN, 255);      // 亮
+        }
+        else
+        {
+          ledcWrite(LED4_PIN, 0);         // 灭
+        }
+      }
+      break;
+    case MODE_BREATHE:        // 呼吸灯
+      if (now - lastBreatheTime >= BREATHE_INTERVAL) {
+        // 重置最后记录的时间
+        lastBreatheTime = now;
+        breathBrighness += breathDirection;
+        if (breathBrighness >= 255) {
+          breathBrighness = 255;
+          breathDirection = -5;
+        }
+        if (breathBrighness <= 0) {
+          breathBrighness = 0;
+          breathDirection = 5;
+        }
+        ledcWrite(LED4_PIN, breathBrighness); 
+      }
+      break;
+  }
+}
+// RGB LED 动画更新 (在 loop 中持续调用)
+void updateRgbAnimation() {
+  unsigned long now = millis();
+  switch (currentRgbMode) {
+    case RGB_IDLE:
+    case RGB_RED_STEADY:
+    case RGB_BLUE_STEADY:
+    case RGB_GREEN_STEADY:
+      // 常亮模式不需要持续更新
+      break;
+    case RGB_COLOR_CHANGE:
+      // 每1秒切换一次颜色
+      if (now - rgbLastUpdate >= 1000) {
+        rgbLastUpdate = now;
+        setBothLedsFromTable(rgbColorIndex);
+        // 更新OLED 显示当前颜色名称
+        showRgbStatus("Color Change", rgbColorIndex);
+        rgbColorIndex = (rgbColorIndex + 1) % COLOR_COUNT;
+      }
+      break;
+    case RGB_RAINBOW:
+      // 每 500ms 切换，两个 LED 显示不同颜色
+      if (now - rgbLastUpdate >= 500) {
+        rgbLastUpdate = now;
+        setLed1FromTable(rgbColorIndex);
+        setLed2FromTable(rgbColorIndex + 3); // LED2偏移3个颜色
+        showRgbStatus("Rainbow", rgbColorIndex);
+        rgbColorIndex  = (rgbColorIndex + 1) % COLOR_COUNT;
+      }
+      break;
+    case RGB_BREATHING:
+      // 呼吸灯效果：用快速开关模拟亮度变化
+      if (now - rgbBreathLastUpdate >= 10) {
+        rgbBreathLastUpdate = now;
+
+        // rgbBreathStep:0~100 模拟亮度
+        // 在每个周期内，LED亮 rgbBreathStep% 的时间
+        int phase = (now / 10) % 100;
+        bool ledOn = (phase < rgbBreathStep);
+        setBothLedsColor(ledOn, ledOn, ledOn); // 白色呼吸
+
+        // 更新亮度步进
+        static unsigned long lastStepTime = 0;
+        if (now - lastStepTime >= 30) {
+          lastStepTime = now;
+          if (rgbBreathDir) {
+            rgbBreathStep += 2;
+            if (rgbBreathStep >= 100) {
+              rgbBreathStep = 100;
+              rgbBreathDir = false;
+            }
+          } else {
+            rgbBreathStep -= 2;
+            if (rgbBreathStep <= 0) {
+              rgbBreathStep = 0;
+              rgbBreathDir = true;
+            }
+          }
+        }
+      }
+      break;
+    case RGB_COLOR_WHEEL:
+      if (now - rgbLastUpdate >= 300) {
+        rgbLastUpdate = now;
+        setLed1FromTable(rgbColorIndex);
+        setLed2FromTable(rgbColorIndex + 1);
+        showRgbStatus("Color Wheel", rgbColorIndex);
+        rgbColorIndex = (rgbColorIndex + 1) % COLOR_COUNT;
+      }
+      break;
+  }
+}
+
+void showRgbStatus(const char* modeName, int colorIdx) {
+  // 只更新底部状态区域，不清除整个屏幕
+  display.fillRect(0, 50, 128, 14, SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 54);
+
+  const char* colorNames[] = {"RED", "GREEN", "BLUE", "YELLOW", "CYAN", "PURPLE", "WHITE"};
+  int idx = colorIdx % COLOR_COUNT;
+  display.print(modeName);
+  display.print(": ");
+  display.print(colorNames[idx]);
+  display.display();
+}
+
+
+void testEachBit() {
+  // 逐位测试，每次只亮一个位，观察哪个灯亮什么颜色
+  for (int bit = 0; bit < 8; bit++) {
+    // 共阳极：0=亮，所以全部设为1(灭)，只把测试位设为0(亮)
+    byte data = 0xFF;         // 全灭
+    data &= ~(1 << bit);     // 只亮这一位
+
+    Serial.print("Testing bit ");
+    Serial.print(bit);
+    Serial.print(" (LSBFIRST → Q");
+    char qName = 'A' + bit;
+    Serial.print(qName);
+    Serial.print(") → data=0x");
+    Serial.println(data, HEX);
+
+    digitalWrite(NLSF_LATCH_PIN, LOW);
+    shiftOut(NLSF_DATA_PIN, NLSF_CLOCK_PIN, LSBFIRST, data);
+    digitalWrite(NLSF_LATCH_PIN, HIGH);
+
+    delay(5000);  // 每个位亮2秒，观察是哪个灯的哪个颜色
+  }
+
+  // 测试完全灭
+  digitalWrite(NLSF_LATCH_PIN, LOW);
+  shiftOut(NLSF_DATA_PIN, NLSF_CLOCK_PIN, LSBFIRST, 0xFF);
+  digitalWrite(NLSF_LATCH_PIN, HIGH);
+}
+
+
+
+void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
   Serial.println("ESP32 Joystick Menu System Starting...");
@@ -191,11 +574,18 @@ void setup()
   pinMode(SEL_PIN, INPUT_PULLUP);
 
 
-  // NLSF 引脚定义
+  // NLSF 595 引脚定义
   pinMode(NLSF_DATA_PIN, OUTPUT);
   pinMode(NLSF_LATCH_PIN, OUTPUT);
   pinMode(NLSF_CLOCK_PIN, OUTPUT);
 
+
+  // LED4 引脚定义
+  ledcAttach(LED4_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcWrite(LED4_PIN, 0);
+
+  // 初始化595，全部输出LOW
+  clearShiftReg();
 
   // 初始化 I2C，指定 SDA 和 SCL 引脚
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -217,6 +607,9 @@ void setup()
   menuStack[0].scrollOffset = 0;
   menuDepth = 0;
 
+  // 临时测试
+  // testEachBit();
+
   drawMenu();
 }
 
@@ -224,12 +617,31 @@ void loop() {
   JoyDirection dir = readJoystick();
 
   if (inActionMode) {
-    // 在动作执行界面，只响应“左”或者“按下”返回
     if (dir == JOY_LEFT || dir == JOY_PRESS) {
       inActionMode = false;
       actionLabel = NULL;
+
+      // 如果有滚动，先停止
+      if (isScroll) {
+        display.stopscroll();
+        isScroll = false;
+      }
+      // 停止RGB动画，关灯
+      currentRgbMode = RGB_IDLE;
+      // 停止 LED 动画，关灯
+      currentLedMode = MODE_OFF;
+
+      allLedsOff();
+      ledOff();
+
+      // goBack();
+      Serial.println("press back (from action)");  // ← 添加打印
       drawMenu();
     }
+    // 持续更新RGB动画
+    updateRgbAnimation();
+    // 持续更新LED动画
+    updateLedAction();
     return;
   }
 
@@ -237,24 +649,25 @@ void loop() {
     handleJoystickInput(dir);
   }
 
-  // 处理选中项的文字水平滚动
   updateTextScroll();
-
+  // 即使在菜单界面，也更新RGB动画（如果有正在运行的）
+  updateRgbAnimation();
 }
 
-// 读取摇杆方向（需要带消抖和长安连续触发）
-// 位置表：
-//   Top-Left(1023,1023)  Top(512,1023)  Top-Right(0,1023)
-//   Left(1023,512)       Center(512,512) Right(0,512)
-//   Bottom-Left(1023,0)  Bottom(512,0)  Bottom-Right(0,0)
-// 换句话来说：
-//   VERT 大 = 上     小 = 下
-//   HORZ 大 = 左     小 = 右
-//   （1023,1023)        (0,1023)
-//             (512,512)
-//    (1023,0)           (0,0)
-
-
+/*
+  读取摇杆方向（需要带消抖和长安连续触发）
+  位置表：
+    Top-Left(1023,1023)  Top(512,1023)  Top-Right(0,1023)
+    Left(1023,512)       Center(512,512) Right(0,512)
+    Bottom-Left(1023,0)  Bottom(512,0)  Bottom-Right(0,0)
+  换句话来说：
+    VERT 大 = 上     小 = 下
+    HORZ 大 = 左     小 = 右
+    （1023,1023)        (0,1023)
+              (512,512)
+     (1023,0)           (0,0)
+*/
+// 获取摇杆方向
 JoyDirection readJoystick() {
   int hVal = analogRead(HORZ_PIN);
   int vVal = analogRead(VERT_PIN);
@@ -399,8 +812,6 @@ void enterSelected() {
     Serial.print("Execute: ");
     Serial.println(item.label);
 
-    
-
     // 显示执行提示界面
     showActionScreen(item.label);
     delay(500);
@@ -411,12 +822,24 @@ void enterSelected() {
 
 // 返回上层菜单
 void goBack() {
+  Serial.println("press back");
+
+  if (isScroll) {
+    display.stopscroll();
+    Serial.println("停止滚动");
+    isScroll = false;
+    display.clearDisplay();
+    display.display();
+  }
   if (menuDepth > 0) {
     menuDepth--;
     resetTextScroll();
     drawMenu();
     Serial.println("Back to parent menu");
+  } else {
+    drawMenu();
   }
+
 }
 
 
@@ -535,7 +958,7 @@ void drawStaticText(const char* text, int x, int y) {
     buf[maxChars - 2] = '.';
     buf[maxChars - 1] = '.';
     buf[maxChars] = '\0';
-  } else{
+  } else {
     strncpy(buf, text, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
   }
@@ -625,7 +1048,6 @@ void resetTextScroll() {
   textScrollPause = TEXT_SCROLL_PAUSE_COUNT;
   lastTextScrollTime = millis();
 }
-
 
 // 绘制右侧滚动条
 void drawScrollBar(int offset, int totalItems, int visibleItems) {
@@ -731,35 +1153,31 @@ void onProgressBarDemo(const char* label) {
 }
 
 
-void updateProgressBar(){
+void updateProgressBar() {
+  int counter = 0;
+  while (true) {
+    if (counter > 100)
+      return;
 
-  // 控制更新速度，每隔50毫秒更新一次
-  static unsigned long lastBarUpdate = 0;
-  unsigned long now = millis();
-  if (now - lastBarUpdate < 50)
-    return;
-  lastBarUpdate = now;
-  // 到100%后停止
-  if (counter > 100)
-    return;
+    // 重绘进度条区域
+    // 先用黑色填充内部区域，清楚旧的进度
+    display.fillRect(11, 26, 106, 13, SSD1306_BLACK);
+    // 计算进度条填充宽度
+    int barWidth = map(counter, 0, 100, 1, 104); // map(值, 原始最小, 原始最大, 目标最小, 目标最大)
 
-  // 重绘进度条区域
-  // 先用黑色填充内部区域，清楚旧的进度
-  display.fillRect(11, 26, 106, 13, SSD1306_BLACK);
-  // 计算进度条填充宽度
-  int barWidth = map(counter, 0, 100, 1, 104); // map(值, 原始最小, 原始最大, 目标最小, 目标最大)
+    display.fillRect(12, 27, barWidth, 11, SSD1306_WHITE);
 
-  display.fillRect(12, 27, barWidth, 11, SSD1306_WHITE);
+    // 显示百分比数字
+    display.fillRect(40, 45, 50, 15, SSD1306_BLACK); // 清楚旧数字
+    display.setTextSize(2);
+    display.setCursor(40, 45);
+    display.print(counter);
+    display.print("%");
 
-  // 显示百分比数字
-  display.fillRect(40, 45, 50, 15, SSD1306_BLACK); // 清楚旧数字
-  display.setTextSize(2);
-  display.setCursor(40, 45);
-  display.print(counter);
-  display.print("%");
-
-  display.display();
-  counter += 2; // 每次增加2%
+    display.display();
+    counter += 2; // 每次增加2%
+    delay(50);
+  }
 }
 
 
@@ -768,14 +1186,69 @@ void onScrollDemo(const char* label) {
   Serial.println(label);
 
   // TODO: 在这里实现 具体 逻辑
+  display.clearDisplay();
+
+  // 绘制标题
+  display.setTextSize(2); // 1 倍大小：6x8 像素/字符
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Scrolling");
+  display.println("Demo!!");
+
+  display.setTextSize(1);
+  display.setCursor(0, 40);
+  display.println("This text will");
+  display.println("scroll around... ");
+  display.display();
+  // 启动水平向左滚动
+  // startscrollleft(起始页，结束页)
+  //     页(page)是SSD1306的显示单位，每页8个像素高
+  //     128×64屏幕有8页（0~7）
+  //     0x00 = 第0页（最上面8行像素）；0x07 = 第7页（最下面8行像素）
+  // 其他滚动函数：
+  //     startscrollright(起始页, 结束页)     → 向右滚
+  //     startscrolldiagleft(起始页, 结束页)  → 左斜滚
+  //     startscrolldiagright(起始页, 结束页) → 右斜滚
+  //     stopscroll()                         → 停止滚动
+  isScroll = true;
+  display.startscrollleft(0x00, 0x07);
+
+
+  Serial.println("显示：滚动演示");
 }
 
+
+void ledOff() {
+  ledcWrite(LED4_PIN, 0);
+}
 
 void onLedAction(const char* label) {
   Serial.print("[LED Action] ");
   Serial.println(label);
 
-  // TODO: 在这里实现 具体 逻辑
+  // 先停止之前的动画，关灯
+  currentLedMode = MODE_OFF;
+  ledOff();
+
+  // 重置动画参数
+  lastBlinkTime = millis();
+
+  if (strcmp(label, "Steady On") == 0) {
+    currentLedMode = MODE_ON;
+    ledcWrite(LED4_PIN, 255);       // LED4 常亮
+  } else if (strcmp(label, "Blinking") == 0) {
+    currentLedMode = MODE_BLINK;
+    lastBlinkTime = 0;
+
+
+  } else if (strcmp(label, "Breathing") == 0) {
+    currentLedMode = MODE_BREATHE;
+    lastBreatheTime = 0;
+
+  } else {
+    currentLedMode = MODE_OFF;
+    ledOff();
+  }
 }
 
 
@@ -785,6 +1258,214 @@ void onRgbLedDemo(const char* label) {
   Serial.println(label);
 
   // TODO: 在这里实现 具体 逻辑
+  // 先停止之前的动画，关灯
+  currentRgbMode = RGB_IDLE;
+  allLedsOff();
+
+  // 重置动画参数
+  rgbColorIndex = 0;
+  rgbBreathStep = 0;
+  rgbBreathDir = true;
+  rgbLastUpdate = millis();
+  rgbBreathLastUpdate = millis();
+  if (strcmp(label, "Red steady on") == 0) {
+    // 红色常亮
+    currentRgbMode = RGB_RED_STEADY;
+    setBothLedsColor(true, false, false);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    // 画一个红色指示圆
+    display.setTextSize(2);
+    display.setCursor(10, 25);
+    display.print("RED");
+
+    display.fillCircle(100, 32, 12, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(93, 29);
+    display.setTextColor(SSD1306_BLACK);
+    display.print("ON");
+
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+  } else if (strcmp(label, "Blue steady on") == 0) {
+    // ---- 蓝色常亮 ----
+    currentRgbMode = RGB_BLUE_STEADY;
+    setBothLedsColor(false, false, true);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    display.setTextSize(2);
+    display.setCursor(10, 25);
+    display.print("BLUE");
+
+    display.fillCircle(100, 32, 12, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(93, 29);
+    display.setTextColor(SSD1306_BLACK);
+    display.print("ON");
+
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+
+  } else if (strcmp(label, "Green steady on") == 0) {
+    // ---- 绿色常亮 ----
+    currentRgbMode = RGB_GREEN_STEADY;
+    setBothLedsColor(false, true, false);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    display.setTextSize(2);
+    display.setCursor(10, 25);
+    display.print("GREEN");
+
+    display.fillCircle(100, 32, 12, SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(93, 29);
+    display.setTextColor(SSD1306_BLACK);
+    display.print("ON");
+
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+  } else if (strcmp(label, "Change color every 1s") == 0) {
+    // ---- 每秒变色 ----
+    currentRgbMode = RGB_COLOR_CHANGE;
+    rgbLastUpdate = 0;  // 立即触发第一次
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(4, 16);
+    display.print("Mode: Color Change");
+    display.setCursor(4, 28);
+    display.print("Interval: 1 second");
+
+    display.setCursor(4, 42);
+    display.print("Colors: R G B Y C P W");
+
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+  } else if (strcmp(label, "Rainbow cycle") == 0) {
+    // ---- 彩虹循环 ----
+    currentRgbMode = RGB_RAINBOW;
+    rgbLastUpdate = 0;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(4, 16);
+    display.print("Mode: Rainbow Cycle");
+    display.setCursor(4, 28);
+    display.print("LED1 & LED2 show");
+    display.setCursor(4, 38);
+    display.print("different colors");
+
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+
+  } else if (strcmp(label, "Breathing effect") == 0) {
+    // ---- 呼吸灯 ----
+    currentRgbMode = RGB_BREATHING;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(4, 16);
+    display.print("Mode: Breathing");
+    display.setCursor(4, 28);
+    display.print("White LED fades");
+    display.setCursor(4, 38);
+    display.print("in and out...");
+
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+
+  } else if (strcmp(label, "Color wheel") == 0) {
+    // ---- 色轮 ----
+    currentRgbMode = RGB_COLOR_WHEEL;
+    rgbLastUpdate = 0;
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    display.setTextSize(1);
+    display.setCursor(4, 16);
+    display.print("Mode: Color Wheel");
+    display.setCursor(4, 28);
+    display.print("Adjacent colors");
+    display.setCursor(4, 38);
+    display.print("rotating...");
+
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+
+  } else if (strcmp(label, "All OFF") == 0) {
+    // ---- 全部关闭 ----
+    currentRgbMode = RGB_IDLE;
+    allLedsOff();
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("RGB LED Demo");
+    display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+    display.setTextSize(2);
+    display.setCursor(30, 25);
+    display.print("OFF");
+
+    display.setTextSize(1);
+    display.setCursor(4, 54);
+    display.print("<< LEFT to back");
+    display.display();
+  }
+
+
 }
 
 
