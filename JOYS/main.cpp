@@ -890,7 +890,21 @@ void drawMenu() {
     MenuItem &parentItem = parent.items[parent.selectedIndex];
     display.setCursor(2, 3);
     display.print("< ");
-    display.print(parentItem.label);
+    // --- 核心优化部分 ---
+    String labelText = parentItem.label;
+    
+    // 假设屏幕一行最多显示 14 个字符
+    // 因为前面已经打印了 "< "（占 2 个字符），所以留给文字的最多只有 12 个字符
+    const int MAX_LEN = 18; 
+
+    if (labelText.length() > MAX_LEN) {
+        // 截取前 9 个字符，并在末尾拼接 "..."
+        // 9 字符 + 3 字符(...) = 12 字符，完美适配
+        labelText = labelText.substring(0, MAX_LEN - 3) + "...";
+    }
+    
+    display.print(labelText);
+    // display.print(parentItem.label);
   }
   // 标题分割线
   display.drawLine(0, TITLE_HEIGHT - 2, SCREEN_WIDTH - 1, TITLE_HEIGHT - 2, SSD1306_WHITE);
@@ -1464,8 +1478,6 @@ void onRgbLedDemo(const char* label) {
     display.print("<< LEFT to back");
     display.display();
   }
-
-
 }
 
 
